@@ -7,6 +7,7 @@ import picocli.CommandLine.Parameters;
 
 import org.apache.http.HttpEntity;
 import org.apache.http.HttpHost;
+import org.apache.http.client.config.RequestConfig;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpRequestBase;
 import org.apache.http.client.methods.HttpGet;
@@ -58,7 +59,10 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.TimeUnit;
 
 @Command(
@@ -86,6 +90,16 @@ public class ujCurl implements Callable<Integer> {
 
     @Option(names = {"-f", "--fail"}, description = "Fail silently (exit 22) on HTTP errors (status >= 400).")
     private boolean fail;
+
+    @Option(names = "--connect-timeout", paramLabel = "<seconds>",
+            description = "Maximum time in seconds allowed for the connection to be established.")
+    private double connectTimeout;
+
+    @Option(names = {"-m", "--max-time"}, paramLabel = "<seconds>",
+            description = "Maximum time in seconds the whole operation may take (exit 28 on timeout).")
+    private double maxTime;
+
+    private final AtomicBoolean timedOut = new AtomicBoolean();
 
     @Option(names = {"-X", "--request"},
             description = "HTTP method to use (e.g., GET, POST, PUT, DELETE, etc.). Defaults to GET.")
@@ -123,6 +137,7 @@ public class ujCurl implements Callable<Integer> {
 
     @Override
     public Integer call() {
+        final Timer timer = new Timer(true);
         try {
             final URI uri = new URI(url);
             final String originalHost = uri.getHost();
@@ -194,7 +209,15 @@ public class ujCurl implements Callable<Integer> {
                     printConnectionInfo(connectHost != null ? connectHost : originalHost, originalPort);
                 }
                 
-                HttpRequestBase httpRequest = createRequest(uri);
+                final HttpRequestBase httpRequest = createRequest(uri);
+                if (connectTimeout > 0) {
+                    httpRequest.setConfig(RequestConfig.custom().setConnectTimeout((int) (connectTimeout * 1000)).build());
+                }
+                if (maxTime > 0) {
+                    timer.schedule(new TimerTask() {
+                        @Override public void run() { timedOut.set(true); httpRequest.abort(); }
+                    }, (long) (maxTime * 1000));
+                }
                 
                 for (String headerString : headers) {
                     if (headerString != null && headerString.contains(":")) {
@@ -250,7 +273,7 @@ public class ujCurl implements Callable<Integer> {
             }
             return 0;
         } catch (Exception e) {
-            int code = exitCodeFor(e);
+            int code = timedOut.get() ? 28 : exitCodeFor(e);
             String msg = e.getMessage();
             if (code == 60) msg = "SSL certificate problem: " + rootMessage(e);
             else if (code == 6) msg = "Could not resolve host: " + rootMessage(e);
@@ -261,6 +284,8 @@ public class ujCurl implements Callable<Integer> {
                 e.printStackTrace(System.err);
             }
             return code;
+        } finally {
+            timer.cancel();
         }
     }
 
@@ -277,7 +302,7 @@ public class ujCurl implements Callable<Integer> {
                     || t instanceof javax.net.ssl.SSLPeerUnverifiedException) return 60;
             if (t instanceof UnknownHostException) return 6;
             if (t instanceof java.net.ConnectException) return 7;
-            if (t instanceof java.net.SocketTimeoutException) return 28;
+            if (t instanceof java.io.InterruptedIOException) return 28; // incl. SocketTimeout, ConnectTimeout
             if (t instanceof java.net.URISyntaxException) return 3;
         }
         for (Throwable t = e; t != null; t = t.getCause()) {
